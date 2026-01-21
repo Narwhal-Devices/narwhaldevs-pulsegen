@@ -1,4 +1,5 @@
 import numpy as np
+import sys
 import time
 import serial
 import serial.tools.list_ports
@@ -60,6 +61,9 @@ class PulseGenerator():
         for comport in comports:
             if 'vid' in vars(comport) and 'pid' in vars(comport):
                 if vars(comport)['vid'] == 1027 and vars(comport)['pid'] == 24592:
+                    if sys.platform == 'linux' and comport.location.endswith('.0'):
+                        # ignore JTAG interface incorrectly exposed as a serial port
+                        continue
                     valid_ports.append(comport)
         # For every valid port, ask for an echo (which also sends serial number etc.) and store the info
         validated_devices = []

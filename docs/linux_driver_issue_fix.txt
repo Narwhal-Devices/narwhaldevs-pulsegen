@@ -1,0 +1,47 @@
+This is a copy from issue #1 on the narwhaldevs-pulsegen repo.
+The suggested fix to comms.py file has been implemented and works.
+If you are having problems with OTHER programs hanging when the pulse generator is attached because they scan ports, try implementing the fix at the bottom of this document.
+See more at https://github.com/Narwhal-Devices/narwhaldevs-pulsegen/issues/1
+
+On Ubuntu 22.04, probing for serial devices hangs due to the device's JTAG interface being incorrectly exposed as a serial port. Calling close() on this serial port after sending two bytes causes a 30-second hang. This is because the USB side of the driver is blocking until the data is sent, but it is never sent so this blocks until a 30-second timeout.
+
+To reprocuce:
+
+With nothing else connected, there are two USB serial ports in /dev. The first one is actually a JTAG interface, and misbehaves if treated as a serial port:
+
+$ ls /dev/ttyUSB*
+/dev/ttyUSB1 /dev/ttyUSB1
+Then in Python:
+
+import serial
+ser = serial.Serial('/dev/ttyUSB0') # the JTAG interface
+ser.write(b'\x00\x00')
+ser.close() # this hangs for 30 seconds
+I'm not sure if this occurs with more recent Linux kernels - I'll find out. To resolve the 30-second hang in narwhal's code, you could filter for the interface number like this to avoid talking to the JTAG interface at all:
+
+diff --git a/src/ndpulsegen/comms.py b/src/ndpulsegen/comms.py
+index b737a39..1cd6683 100644
+--- a/src/ndpulsegen/comms.py
++++ b/src/ndpulsegen/comms.py
+@@ -1,4 +1,5 @@
+ import numpy as np
++import sys
+ import time
+ import serial
+ import serial.tools.list_ports
+@@ -60,6 +61,9 @@ class PulseGenerator():
+         for comport in comports:
+             if 'vid' in vars(comport) and 'pid' in vars(comport):
+                 if vars(comport)['vid'] == 1027 and vars(comport)['pid'] == 24592:
++                    if sys.platform == 'linux' and comport.location.endswith('.0'):
++                        # ignore JTAG interface incorrectly exposed as a serial port
++                        continue
+                     valid_ports.append(comport)
+         # For every valid port, ask for an echo (which also sends serial number etc.) and store the info
+         validated_devices = []
+On systems where it may not be ideal to have a misbehaving serial port, e.g. if other software also has some serial port scanning where it sends data to all serial ports and would be vulnerable to hanging, one can add a udev rule to unbind the JTAG interface so that no software sees it at all:
+
+/etc/udev/rules.d/99-alchitry.rules:
+
+# Alchitry Au: interface 0 is JTAG, not a real UART - unbind ftdi_sio
+ACTION=="bind", SUBSYSTEM=="usb", DRIVER=="ftdi_sio", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6010", ATTR{interface}=="Alchitry Au", ATTR{bInterfaceNumber}=="00", RUN+="/bin/sh -c 'echo %k > /sys/bus/usb/drivers/ftdi_sio/unbind'"
