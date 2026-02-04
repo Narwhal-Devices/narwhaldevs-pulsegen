@@ -217,11 +217,13 @@ class PulseGenerator(QObject):
         validated_devices = []
         unvalidated = []
         comports = list(serial.tools.list_ports.comports())
-        valid_ports = [
-            cp
-            for cp in comports
-            if getattr(cp, "vid", None) == self._valid_vid and getattr(cp, "pid", None) == self._valid_pid
-        ]
+        valid_ports = []
+        for cp in comports:
+            if getattr(cp, "vid", None) == self._valid_vid and getattr(cp, "pid", None) == self._valid_pid:
+                if sys.platform == 'linux' and cp.location.endswith('.0'):
+                        # ignore JTAG interface incorrectly exposed as a serial port
+                        continue
+                valid_ports.append(cp)
         for cp in valid_ports:
             ok, meta = self._try_handshake(cp.device)
             if ok and meta:
