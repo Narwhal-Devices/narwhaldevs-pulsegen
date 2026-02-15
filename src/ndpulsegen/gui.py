@@ -6,6 +6,8 @@ import time
 import threading
 from typing import Optional, List, Dict, Any
 import json
+import os
+import tempfile
 
 from PyQt5.QtCore import (
     Qt, QObject, QThread, pyqtSignal, QTimer, QSettings, QSize
@@ -16,12 +18,142 @@ from PyQt5.QtWidgets import (
     QTextEdit, QDoubleSpinBox, QLineEdit, QMessageBox, QScrollArea, QFrame,
     QSizePolicy,
 )
-
+from PyQt5.QtGui import QFontDatabase, QIcon, QPixmap, QPainter, QColor, QFont, QIcon
 
 import serial
 import serial.tools.list_ports
 
 from . import transcode
+
+def make_serial_exclusive(**kwargs):
+    """Create a pyserial Serial() with best-effort OS-level exclusivity (POSIX).
+    Falls back gracefully on platforms/pyserial versions that don't support it."""
+    try:
+        return serial.Serial(exclusive=True, **kwargs)
+    except TypeError:
+        s = serial.Serial(**kwargs)
+        # Some pyserial builds expose .exclusive attribute (POSIX only).
+        try:
+            s.exclusive = True
+        except Exception:
+            pass
+        return s
+
+
+
+def create_app_icon() -> QIcon:
+    """Create a simple in-code app icon so the dock/taskbar icon isn't blank.
+
+    This avoids shipping an external .icns/.ico file and works on Windows/macOS/Linux.
+    """
+    size = 256
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    # Blue circle
+    p.setBrush(QColor(0, 122, 255))  # macOS-ish accent blue
+    p.setPen(Qt.NoPen)
+    margin = int(size * 0.08)
+    p.drawEllipse(margin, margin, size - 2*margin, size - 2*margin)
+
+    # White "N"
+    font = QFont()
+    font.setBold(True)
+    font.setPointSize(int(size * 0.55))
+    p.setFont(font)
+    p.setPen(QColor(255, 255, 255))
+    p.drawText(pm.rect(), Qt.AlignCenter, "N")
+
+    p.end()
+    return QIcon(pm)
+
+
+# -----------------------
+# Cross-process device settings lock
+# -----------------------
+# We use a per-device lock file so multiple GUI instances can coordinate operations
+# like deleting a device's saved labels/groups. This is advisory and only effective
+# between ndpulsegen GUI instances (which is exactly what we need here).
+
+class InterProcessLock:
+    """Simple cross-platform inter-process file lock.
+
+    - macOS/Linux: fcntl.flock
+    - Windows: msvcrt.locking
+
+    This is an *advisory* lock, intended to coordinate between our own GUI instances.
+    """
+
+    def __init__(self, lock_path: str):
+        self.lock_path = lock_path
+        self._fh = None
+
+    def acquire(self, blocking: bool = False) -> bool:
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        # Open (and keep open) for duration of lock.
+        self._fh = open(self.lock_path, "a+")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+                try:
+                    # Lock 1 byte from start
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), mode, 1)
+                except OSError:
+                    return False
+            else:
+                import fcntl
+                flags = fcntl.LOCK_EX
+                if not blocking:
+                    flags |= fcntl.LOCK_NB
+                try:
+                    fcntl.flock(self._fh.fileno(), flags)
+                except OSError:
+                    return False
+            return True
+        except Exception:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+            return False
+
+    def release(self) -> None:
+        if not self._fh:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+
+    def __enter__(self):
+        ok = self.acquire(blocking=True)
+        if not ok:
+            raise RuntimeError("Unable to acquire lock")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+
+def device_settings_lock_path(serial_number: int) -> str:
+    base = os.path.join(tempfile.gettempdir(), "ndpulsegen_locks")
+    return os.path.join(base, f"device_{int(serial_number)}.lock")
 
 
 class SerialWorker(QObject):
@@ -116,7 +248,7 @@ class PulseGenerator(QObject):
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
-        self.ser = serial.Serial()
+        self.ser = make_serial_exclusive()
         self.ser.timeout = 0.1
         self.ser.write_timeout = 1
         self.ser.baudrate = 12000000
@@ -125,6 +257,8 @@ class PulseGenerator(QObject):
         self._thread: Optional[QThread] = None
         self._worker: Optional[SerialWorker] = None
 
+        self._disconnecting_due_to_error = False
+
         self._valid_vid = 1027
         self._valid_pid = 24592
 
@@ -132,9 +266,38 @@ class PulseGenerator(QObject):
         self.device_type: Optional[int] = None
         self.firmware_version: Optional[str] = None
         self.hardware_version: Optional[str] = None
+        self._device_settings_lock: Optional[InterProcessLock] = None
 
     def is_open(self) -> bool:
         return bool(self.ser and self.ser.is_open)
+
+
+    def _handle_serial_error(self, message: str) -> None:
+        """Handle a serial-layer failure (USB unplug, port reset, etc).
+
+        Ensures we transition to the disconnected state exactly once.
+        """
+        # Avoid re-entrancy / multiple disconnect cascades
+        if self._disconnecting_due_to_error:
+            return
+        self._disconnecting_due_to_error = True
+
+        # Surface the error to the UI
+        try:
+            self.errorOccurred.emit(message)
+        except Exception:
+            pass
+
+        # Defer the actual disconnect onto the Qt event loop to avoid threading issues
+        try:
+            QTimer.singleShot(0, self.disconnect)
+        except Exception:
+            # If QTimer isn't available for some reason, fall back
+            try:
+                self.disconnect()
+            except Exception:
+                pass
+
 
     def _start_reader(self):
         self._thread = QThread()
@@ -148,7 +311,7 @@ class PulseGenerator(QObject):
         self._worker.easyprint.connect(self.easyprint)
         self._worker.internalError.connect(self.internalError)
         self._worker.bytesDropped.connect(self.bytesDropped)
-        self._worker.errorOccurred.connect(self.errorOccurred)
+        self._worker.errorOccurred.connect(self._handle_serial_error)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
@@ -173,6 +336,14 @@ class PulseGenerator(QObject):
                 if self.ser and self.ser.is_open:
                     self.ser.close()
             finally:
+                # Release per-device settings lock (if held)
+                try:
+                    if self._device_settings_lock is not None:
+                        self._device_settings_lock.release()
+                except Exception:
+                    pass
+                self._device_settings_lock = None
+                self._disconnecting_due_to_error = False
                 self.disconnected.emit()
 
     def connect(self, serial_number: Optional[int] = None, port: Optional[str] = None) -> bool:
@@ -186,7 +357,7 @@ class PulseGenerator(QObject):
 
         target_port = None
         device_meta = None
-        if serial_number is not None or port is None:
+        if port is None:
             devices = self.get_connected_devices()["validated_devices"]
             for d in devices:
                 if (serial_number is not None and d.get("serial_number") == serial_number) or (
@@ -200,17 +371,60 @@ class PulseGenerator(QObject):
         if not target_port:
             return False
 
+        self._disconnecting_due_to_error = False
         self.ser.port = target_port
         self.ser.open()
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
+        # Populate device metadata immediately using an echo on the already-open connection
+        ok_echo, meta = self._echo_on_open_serial(timeout_s=1.0)
+        if ok_echo and meta:
+            self.serial_number_save = meta.get('serial_number')
+            self.device_type = meta.get('device_type')
+            self.firmware_version = meta.get('firmware_version')
+            self.hardware_version = meta.get('hardware_version')
+            # Hold a per-device settings lock while connected so other GUI instances
+            # can safely avoid deleting/editing settings for this device concurrently.
+            try:
+                sn_lock = int(self.serial_number_save) if self.serial_number_save is not None else None
+            except Exception:
+                sn_lock = None
+            if sn_lock is not None:
+                lk = InterProcessLock(device_settings_lock_path(sn_lock))
+                if lk.acquire(blocking=False):
+                    self._device_settings_lock = lk
+                else:
+                    # Someone else is using this device's settings (another GUI instance).
+                    # Don't proceed.
+                    try:
+                        self.ser.close()
+                    except Exception:
+                        pass
+                    self._device_settings_lock = None
+                    self.errorOccurred.emit('Device settings are in use by another instance.')
+                    return False
+            # Update UI immediately (MainWindow.on_echo)
+            try:
+                self.echo.emit({
+                    'serial_number': self.serial_number_save,
+                    'device_type': self.device_type,
+                    'firmware_version': self.firmware_version,
+                    'hardware_version': self.hardware_version,
+                })
+            except Exception:
+                pass
         self._start_reader()
+        # Note: serial_number_save is populated from the device echo above.
 
         if device_meta:
-            self.serial_number_save = device_meta.get("serial_number")
-            self.device_type = device_meta.get("device_type")
-            self.firmware_version = device_meta.get("firmware_version")
-            self.hardware_version = device_meta.get("hardware_version")
+            if self.serial_number_save is None:
+                self.serial_number_save = device_meta.get("serial_number")
+            if self.device_type is None:
+                self.device_type = device_meta.get("device_type")
+            if self.firmware_version is None:
+                self.firmware_version = device_meta.get("firmware_version")
+            if self.hardware_version is None:
+                self.hardware_version = device_meta.get("hardware_version")
         return True
 
     def get_connected_devices(self) -> Dict[str, Any]:
@@ -234,7 +448,7 @@ class PulseGenerator(QObject):
         return {"validated_devices": validated_devices, "unvalidated_devices": unvalidated}
 
     def _try_handshake(self, port: str, timeout_s: float = 1.0):
-        s = serial.Serial()
+        s = make_serial_exclusive()
         s.port = port
         s.baudrate = self.ser.baudrate
         s.timeout = 0.2
@@ -276,11 +490,59 @@ class PulseGenerator(QObject):
             except Exception:
                 pass
 
+    
+    def _echo_on_open_serial(self, timeout_s: float = 1.0):
+        """
+        Send an echo request on the already-open self.ser and synchronously parse the response.
+        Returns (ok, meta_dict) where meta_dict includes device_type/hardware_version/firmware_version/serial_number.
+        Note: This runs *before* the reader thread starts, so it won't race with the worker.
+        """
+        if not self.is_open():
+            return False, None
+        try:
+            # Clear any stale bytes
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+            except Exception:
+                pass
+
+            check_byte = bytes([209])
+            self.ser.write(transcode.encode_echo(check_byte))
+            t0 = time.time()
+            while time.time() - t0 < timeout_s:
+                b = self.ser.read(1)
+                if not b:
+                    continue
+                msg_id = b[0]
+                dinfo = transcode.msgin_decodeinfo.get(msg_id)
+                if not dinfo:
+                    continue
+                remaining = dinfo["message_length"] - 1
+                payload = self.ser.read(remaining)
+                if len(payload) != remaining:
+                    continue
+                decoded = dinfo["decode_function"](payload)
+                if dinfo["message_type"] == "echo" and decoded.get("echoed_byte") == check_byte:
+                    return True, {
+                        "device_type": decoded.get("device_type"),
+                        "hardware_version": decoded.get("hardware_version"),
+                        "firmware_version": decoded.get("firmware_version"),
+                        "serial_number": decoded.get("serial_number"),
+                    }
+            return False, None
+        except Exception:
+            return False, None
+
     def write_command(self, encoded_command: bytes):
         if not self.is_open():
             raise serial.serialutil.PortNotOpenError("Serial port is not open")
         with self._write_lock:
-            self.ser.write(encoded_command)
+            try:
+                self.ser.write(encoded_command)
+            except (serial.serialutil.SerialException, OSError) as ex:
+                self._handle_serial_error(str(ex))
+                raise
 
     def write_echo(self, byte_to_echo: bytes):
         self.write_command(transcode.encode_echo(byte_to_echo))
@@ -507,6 +769,7 @@ class MainWindow(QMainWindow):
         self.pg.connected.connect(self.on_connected)
         self.pg.disconnected.connect(self.on_disconnected)
 
+        monofont = QFontDatabase.systemFont(QFontDatabase.FixedFont)
         # Status bar
         self.connStatusLabel = QLabel("Disconnected")
         self.statusBar().addPermanentWidget(self.connStatusLabel)
@@ -526,8 +789,11 @@ class MainWindow(QMainWindow):
         self.disconnectAction.triggered.connect(self.disconnect_device)
         toolbar.addAction(self.disconnectAction)
 
+        self.disconnectAction.setEnabled(False)
+
         # Device chooser
         self.deviceComboBox = QComboBox()
+        self.deviceComboBox.currentIndexChanged.connect(self.on_device_selection_changed)
 
         # ---- Manual outputs group (top half) ----
         channelGrid = QGridLayout()
@@ -539,12 +805,9 @@ class MainWindow(QMainWindow):
             vbox.setSpacing(2)
             label_edit = QLineEdit()
             label_edit.setPlaceholderText(f"Ch {i}")
-            saved = self.settings.value(f"channels/{i}", "")
-            if saved is None:
-                saved = ""
-            label_edit.setText(saved)
+            label_edit.setText("")
             label_edit.editingFinished.connect(
-                lambda i=i, e=label_edit: self.settings.setValue(f"channels/{i}", e.text())
+                lambda i=i, e=label_edit: self.save_channel_label(i, e)
             )
             vbox.addWidget(label_edit)
 
@@ -601,8 +864,7 @@ class MainWindow(QMainWindow):
         self.addGroupRow = 1
         self._place_add_group_button(self.addGroupRow)
 
-        # Load saved groups
-        self.load_groups_from_settings()
+        # Groups/labels are loaded per-device when a device is selected.
 
 
 
@@ -630,6 +892,7 @@ class MainWindow(QMainWindow):
         statusLayout.addWidget(self.finalAddrLabel, 4, 1)
         statusLayout.addWidget(QLabel("Total run time:"), 5, 0)
         self.runTimeLabel = QLabel("—")
+        self.runTimeLabel.setFont(monofont)
         statusLayout.addWidget(self.runTimeLabel, 5, 1)
 
         # Synchronisation
@@ -742,7 +1005,14 @@ class MainWindow(QMainWindow):
 
         # Central layout
         centralLayout = QVBoxLayout()
-        centralLayout.addWidget(self.deviceComboBox)
+        # Device chooser + forget button
+        deviceRow = QHBoxLayout()
+        deviceRow.addWidget(self.deviceComboBox, 1)
+        self.forgetDeviceButton = QPushButton('Forget device')
+        self.forgetDeviceButton.setToolTip('Delete saved channel/group names for the selected device')
+        self.forgetDeviceButton.clicked.connect(self.forget_selected_device)
+        deviceRow.addWidget(self.forgetDeviceButton)
+        centralLayout.addLayout(deviceRow)
         centralLayout.addWidget(manualBox)
         centralLayout.addWidget(self.groupsBox)
         centralLayout.addLayout(bottomCols)
@@ -766,9 +1036,205 @@ class MainWindow(QMainWindow):
         # Initial device scan
         self.check_devices()
 
-        # If exactly one device is present at startup, auto-connect to it
-        if self.deviceComboBox.count() == 1:
+        # If exactly one *connected* device is present at startup, auto-connect to it
+        connected_indices = []
+        for i in range(self.deviceComboBox.count()):
+            d = self.deviceComboBox.itemData(i)
+            if isinstance(d, dict) and d.get("connected") is True:
+                connected_indices.append(i)
+        if len(connected_indices) == 1:
+            self.deviceComboBox.setCurrentIndex(connected_indices[0])
             self.connect_device()
+
+        # Load labels/groups for the currently selected device (even if not connected)
+        self.on_device_selection_changed(self.deviceComboBox.currentIndex())
+
+
+
+    # ---- Per-device settings helpers ----
+    def _current_serial(self) -> Optional[str]:
+        idx = self.deviceComboBox.currentIndex()
+        if idx < 0:
+            return None
+        dev = self.deviceComboBox.itemData(idx)
+        if isinstance(dev, dict):
+            sn = dev.get("serial_number")
+            return str(sn) if sn not in (None, "") else None
+        return None
+
+    def _device_key(self, subkey: str) -> str:
+        """Return a QSettings key namespaced to the currently selected device serial."""
+        sn = self._current_serial()
+        if not sn:
+            # No device selected: don't mix settings between devices.
+            return ""
+        return f"devices/{sn}/{subkey}"
+
+    def _get_known_serials(self) -> List[str]:
+        raw = self.settings.value("known_serials", "", type=str)
+        if not raw:
+            return []
+        try:
+            vals = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(vals, list):
+            return []
+        out: List[str] = []
+        for v in vals:
+            if v is None:
+                continue
+            sv = str(v).strip()
+            if sv:
+                out.append(sv)
+        # de-dup while preserving order
+        seen = set()
+        uniq = []
+        for sv in out:
+            if sv in seen:
+                continue
+            seen.add(sv)
+            uniq.append(sv)
+        return uniq
+
+    def _set_known_serials(self, serials: List[str]) -> None:
+        # Store as JSON list
+        self.settings.setValue("known_serials", json.dumps(serials))
+
+    def _remember_serial(self, sn: Optional[str]) -> None:
+        if not sn:
+            return
+        serials = self._get_known_serials()
+        if sn not in serials:
+            serials.append(sn)
+            self._set_known_serials(serials)
+
+
+    def _migrate_legacy_settings_to_device(self, sn: str) -> None:
+        """One-time migration: if per-device keys are empty, copy legacy global keys."""
+        # Migrate channel labels
+        any_device_label = False
+        for i in range(24):
+            dk = f"devices/{sn}/channels/{i}"
+            if self.settings.value(dk, "", type=str):
+                any_device_label = True
+                break
+
+        if not any_device_label:
+            for i in range(24):
+                legacy = self.settings.value(f"channels/{i}", "", type=str)
+                if legacy:
+                    self.settings.setValue(f"devices/{sn}/channels/{i}", legacy)
+
+        # Migrate groups
+        device_groups_key = f"devices/{sn}/channel_groups"
+        if not self.settings.value(device_groups_key, "", type=str):
+            legacy_groups = self.settings.value("channel_groups", "", type=str)
+            if legacy_groups:
+                self.settings.setValue(device_groups_key, legacy_groups)
+
+
+    def save_channel_label(self, channel_index: int, edit: QLineEdit) -> None:
+        key = self._device_key(f"channels/{channel_index}")
+        if not key:
+            return
+        self.settings.setValue(key, edit.text())
+
+    def load_channel_labels_for_current_device(self) -> None:
+        sn = self._current_serial()
+        # Update placeholders to include the serial (nice UX), but keep it subtle.
+        for i, (label_edit, _) in enumerate(self.channelWidgets):
+            label_edit.setPlaceholderText(f"Ch {i}")
+            if not sn:
+                label_edit.setText("")
+                continue
+            key = f"devices/{sn}/channels/{i}"
+            saved = self.settings.value(key, "", type=str)
+            if saved is None:
+                saved = ""
+            # Avoid moving cursor / triggering odd focus behaviour if user is actively editing.
+            old_block = label_edit.blockSignals(True)
+            label_edit.setText(saved)
+            label_edit.blockSignals(old_block)
+
+    def clear_groups_ui(self) -> None:
+        # Remove all existing group rows
+        for cfg in list(self.groupConfigs):
+            for w in cfg.get("widgets", []):
+                self.groupsGrid.removeWidget(w)
+                w.deleteLater()
+        self.groupConfigs = []
+        # Re-place Add Group button row
+        self.addGroupRow = 1
+        self._place_add_group_button(self.addGroupRow)
+
+    def on_device_selection_changed(self, idx: int) -> None:
+        # Called when the device dropdown changes (or when we explicitly refresh devices).
+        sn = self._current_serial()
+        if sn:
+            self._remember_serial(sn)
+            self._migrate_legacy_settings_to_device(sn)
+
+        # Swap labels/groups to match selected serial.
+        self.load_channel_labels_for_current_device()
+        self.clear_groups_ui()
+        self.load_groups_from_settings()
+
+    def forget_selected_device(self) -> None:
+        """Delete saved channel/group names for the selected device from QSettings.
+
+        Safety rules:
+        - You cannot delete settings for the device this GUI instance is currently connected to.
+        - If another ndpulsegen GUI instance is connected to that device, it should be holding
+          a per-device settings lock, and we will refuse to delete.
+        """
+        dev = self.deviceComboBox.currentData()
+        if not isinstance(dev, dict):
+            self.statusBar().showMessage("No device selected.", 3000)
+            return
+        sn = dev.get("serial_number")
+        if sn is None:
+            self.statusBar().showMessage("Selected item has no serial number.", 4000)
+            return
+        try:
+            sn_int = int(sn)
+        except Exception:
+            self.statusBar().showMessage("Invalid serial number.", 4000)
+            return
+
+        # Don't allow deleting settings for the device we're currently connected to.
+        if self.pg.is_open():
+            cur_sn = getattr(self.pg, "serial_number_save", None)
+            try:
+                if cur_sn is not None and int(cur_sn) == sn_int:
+                    self.statusBar().showMessage("Disconnect before forgetting the connected device.", 5000)
+                    return
+            except Exception:
+                pass
+
+        # Try to acquire the per-device lock. If another instance is using the device/settings, refuse.
+        lk = InterProcessLock(device_settings_lock_path(sn_int))
+        if not lk.acquire(blocking=False):
+            self.statusBar().showMessage("Cannot forget: device settings are in use by another instance.", 6000)
+            return
+
+        try:
+            # Remove device-specific settings subtree
+            self.settings.remove(f"devices/{sn_int}")
+
+            # Also remove from known serials list
+            serials = self._get_known_serials()
+            serials = [s for s in serials if str(s) != str(sn_int)]
+            self._set_known_serials(serials)
+
+            self.settings.sync()
+            self.statusBar().showMessage(f"Forgot device {sn_int}.", 4000)
+        finally:
+            lk.release()
+
+        # Refresh list/UI
+        self.check_devices()
+
 
 
     # Helpers
@@ -779,6 +1245,27 @@ class MainWindow(QMainWindow):
             if on
             else "background-color: red; border-radius: 8px;"
         )
+
+
+    def _update_tickspin_from_device(self, spin: 'TickSpinBox', ticks: int) -> None:
+        """Update a TickSpinBox from device state without fighting user typing.
+
+        When the user is actively editing (spin or its lineEdit has focus), skip the update
+        so the typed text isn't immediately overwritten by the 100 ms poll loop.
+        """
+        try:
+            le = spin.lineEdit()
+            if spin.hasFocus() or (le is not None and le.hasFocus()):
+                return
+        except Exception:
+            pass
+
+        old = spin.blockSignals(True)
+        try:
+            spin.set_value_from_ticks(ticks)
+        finally:
+            spin.blockSignals(old)
+
 
     def _state_to_bools(self, state_val) -> List[bool]:
         """
@@ -924,7 +1411,10 @@ class MainWindow(QMainWindow):
         """
         Load channel groups from QSettings. If none exist, create one example group.
         """
-        data = self.settings.value("channel_groups", "", type=str)
+        key = self._device_key("channel_groups")
+        if not key:
+            return
+        data = self.settings.value(key, "", type=str)
         # if not data:
         #     # No saved groups: create a single example group (only once)
         #     self.add_group(name="Example", active_high="0,1,2", active_low="3,4,5")
@@ -961,7 +1451,10 @@ class MainWindow(QMainWindow):
                     "off": cfg["off"].text(),
                 }
             )
-        self.settings.setValue("channel_groups", json.dumps(groups))
+        key = self._device_key("channel_groups")
+        if not key:
+            return
+        self.settings.setValue(key, json.dumps(groups))
 
 
     def parse_channel_list(self, text: str) -> set:
@@ -1101,14 +1594,57 @@ class MainWindow(QMainWindow):
     # Connection actions
     def check_devices(self):
         try:
+            prev_sn = self._current_serial()
+
             devs = self.pg.get_connected_devices().get("validated_devices", [])
-            self.deviceComboBox.clear()
+            connected_by_sn: Dict[str, dict] = {}
             for d in devs:
-                label = f"SN {d.get('serial_number')} | FW {d.get('firmware_version')} | {d.get('comport')}"
-                self.deviceComboBox.addItem(label, d)
-            self.statusBar().showMessage("Devices updated." if devs else "No devices found.", 3000)
+                sn = d.get("serial_number")
+                if sn is None:
+                    continue
+                sn = str(sn)
+                connected_by_sn[sn] = dict(d)
+                self._remember_serial(sn)
+
+            known = self._get_known_serials()
+
+            # Build ordered list: connected first (in reported order), then known-but-not-connected.
+            connected_sns = [str(d.get("serial_number")) for d in devs if d.get("serial_number") is not None]
+            extra_sns = [sn for sn in known if sn not in connected_by_sn]
+            all_sns = connected_sns + extra_sns
+
+            old_block = self.deviceComboBox.blockSignals(True)
+            self.deviceComboBox.clear()
+
+            for sn in all_sns:
+                if sn in connected_by_sn:
+                    d = connected_by_sn[sn]
+                    label = f"SN {sn} | FW {d.get('firmware_version')} | {d.get('comport')}"
+                    d2 = dict(d)
+                    d2["serial_number"] = sn
+                    d2["connected"] = True
+                    self.deviceComboBox.addItem(label, d2)
+                else:
+                    d2 = {"serial_number": sn, "firmware_version": "", "comport": "", "connected": False}
+                    label = f"SN {sn} | (not connected)"
+                    self.deviceComboBox.addItem(label, d2)
+
+            # Restore selection where possible
+            if all_sns:
+                if prev_sn and prev_sn in all_sns:
+                    self.deviceComboBox.setCurrentIndex(all_sns.index(prev_sn))
+                else:
+                    self.deviceComboBox.setCurrentIndex(0)
+
+            self.deviceComboBox.blockSignals(old_block)
+
+            # Apply per-device UI state for current selection
+            self.on_device_selection_changed(self.deviceComboBox.currentIndex())
+
+            self.statusBar().showMessage("Devices updated." if all_sns else "No devices found.", 3000)
         except Exception as e:
             self.statusBar().showMessage(f"Error checking devices: {e}", 5000)
+
 
     def connect_device(self):
         idx = self.deviceComboBox.currentIndex()
@@ -1116,17 +1652,33 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Connect", "No device selected.")
             return
         dev = self.deviceComboBox.itemData(idx)
+        if not isinstance(dev, dict) or not dev.get("serial_number"):
+            QMessageBox.warning(self, "Connect", "Invalid device selection.")
+            return
+        if dev.get("connected") is False:
+            QMessageBox.warning(self, "Connect", "That device is not currently connected. Plug it in and click Refresh.")
+            return
         try:
-            ok = self.pg.connect(serial_number=dev.get("serial_number"))
+            # ok = self.pg.connect(serial_number=dev.get("serial_number"))
+
+            try:
+                sn_int = int(dev.get("serial_number"))
+            except (TypeError, ValueError):
+                QMessageBox.warning(self, "Connect", "Invalid serial number for selected device.")
+                return
+
+            # Set UI to a connecting state *before* calling pg.connect(), because pg.connect() emits
+            # the 'connected' signal synchronously and on_connected() will set the final state.
+            self.statusBar().showMessage("Connecting…", 2000)
+            self.connStatusLabel.setText("Connecting…")
+            self.portLabel.setText(str(dev.get("comport")))
+            self.snLabel.setText(str(dev.get("serial_number")))
+
+            ok = self.pg.connect(serial_number=sn_int, port=dev.get('comport'))
             if ok:
-                self.statusBar().showMessage("Connected", 2000)
-                self.connStatusLabel.setText(f"Connected: {dev.get('comport')}")
-                self.portLabel.setText(str(dev.get("comport")))
-                self.snLabel.setText(str(dev.get("serial_number")))
-                self.devTypeLabel.setText(str(dev.get("device_type")))
-                self.fwLabel.setText(str(dev.get("firmware_version")))
-                self.hwLabel.setText(str(dev.get("hardware_version")))
-                self.request_timer.start()
+                # Device-info fields will be populated by the immediate echo emitted from pg.connect()
+                # and periodic polling will start in on_connected().
+                pass
             else:
                 self.statusBar().showMessage("Connect failed: device not found.", 4000)
         except Exception as e:
@@ -1152,14 +1704,33 @@ class MainWindow(QMainWindow):
 
     # Worker slots
     def on_connected(self, port: str):
-        self.statusBar().showMessage(f"Connected on {port}", 3000)
-        self.connStatusLabel.setText(f"Connected: {port}")
+        serial = getattr(self.pg, 'serial_number_save', None)
+        serial_str = str(serial) if serial is not None else "—"
+        self.statusBar().showMessage(f"Connected (SN {serial_str}) on {port}", 3000)
+        self.connStatusLabel.setText(f"Connected: {serial_str}")
         self.portLabel.setText(port)
+        # Button state
+        self.connectAction.setEnabled(False)
+        self.disconnectAction.setEnabled(True)
+        self.refreshAction.setEnabled(False)
+        # Start periodic status polling
+        if not self.request_timer.isActive():
+            self.request_timer.start()
+            self.poll_status()
 
     def on_disconnected(self):
         self.statusBar().showMessage("Disconnected", 3000)
         self.connStatusLabel.setText("Disconnected")
         self.portLabel.setText("—")
+        # Button state
+        self.connectAction.setEnabled(True)
+        self.disconnectAction.setEnabled(False)
+        self.refreshAction.setEnabled(True)
+                # Stop periodic status polling
+        if self.request_timer.isActive():
+            self.request_timer.stop()
+# Auto refresh so the list reflects the unplug immediately
+        QTimer.singleShot(0, self.check_devices)
 
     def on_error(self, message: str):
         self.statusBar().showMessage(f"ERROR: {message}", 5000)
@@ -1208,16 +1779,43 @@ class MainWindow(QMainWindow):
         self.waitCheckbox.setChecked(bool(trig_on_powerline))
         self.waitCheckbox.blockSignals(old)
 
-        # Update delay spinbox
+        # Update delay spinbox (don’t overwrite while user is typing)
         delay_cycles = msg["powerline_trigger_delay"]
-        old = self.delaySpin.blockSignals(True)
-        self.delaySpin.set_value_from_ticks(delay_cycles)
-        self.delaySpin.blockSignals(old)
+        self._update_tickspin_from_device(self.delaySpin, delay_cycles)
+
+    @staticmethod
+    def _format_run_time_cycles(run_time_cycles: Any) -> str:
+        """Format FPGA run-time counter (10 ns ticks) as d hh:mm:ss.nnn nnn nnn."""
+        # Use integer arithmetic to preserve nanosecond formatting (even though tick is 10 ns).
+        try:
+            cycles = int(run_time_cycles)
+        except (TypeError, ValueError):
+            return "—"
+        if cycles < 0:
+            return "—"
+
+        total_ns = cycles * 10  # 10 ns per FPGA clock tick
+
+        NS_PER_DAY = 86_400 * 1_000_000_000
+        NS_PER_HOUR = 3_600 * 1_000_000_000
+        NS_PER_MIN = 60 * 1_000_000_000
+
+        days, rem = divmod(total_ns, NS_PER_DAY)
+        hours, rem = divmod(rem, NS_PER_HOUR)
+        minutes, rem = divmod(rem, NS_PER_MIN)
+        seconds, ns = divmod(rem, 1_000_000_000)
+
+        # Group the fractional part in triplets using a narrow no-break space (looks like a half space).
+        sep = "\u202f"
+        frac = f"{ns:09d}"
+        frac_grouped = f"{frac[0:3]}{sep}{frac[3:6]}{sep}{frac[6:9]}"
+
+        return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}.{frac_grouped}"
 
     def on_devicestate_extras(self, msg: dict):
         # decode_devicestate_extras returns 'run_time'
         run_time = msg["run_time"]
-        self.runTimeLabel.setText(f"{run_time}")
+        self.runTimeLabel.setText(self._format_run_time_cycles(run_time))
 
     def on_devicestate(self, ds: dict):
         # decode_devicestate returns a fixed set of keys; no need for existence checks
@@ -1250,15 +1848,11 @@ class MainWindow(QMainWindow):
 
         # trigger_out_length
         trig_len_cycles = ds["trigger_out_length"]
-        old = self.trigOutLenSpin.blockSignals(True)
-        self.trigOutLenSpin.set_value_from_ticks(trig_len_cycles)
-        self.trigOutLenSpin.blockSignals(old)
+        self._update_tickspin_from_device(self.trigOutLenSpin, trig_len_cycles)
 
         # trigger_out_delay
         trig_delay_cycles = ds["trigger_out_delay"]
-        old = self.trigOutDelaySpin.blockSignals(True)
-        self.trigOutDelaySpin.set_value_from_ticks(trig_delay_cycles)
-        self.trigOutDelaySpin.blockSignals(old)
+        self._update_tickspin_from_device(self.trigOutDelaySpin, trig_delay_cycles)
 
         # Output state -> manual buttons
         self._apply_state_to_buttons(self._state_to_bools(ds["state"]))
@@ -1271,10 +1865,23 @@ class MainWindow(QMainWindow):
         finally:
             super().closeEvent(ev)
 
-
 def main():
     app = QApplication(sys.argv)
+
+    # Load icon relative to this file
+    base_dir = os.path.abspath(os.path.dirname(__file__))
+    icon_path = os.path.join(base_dir, "icons", "ndpulsegen.png")
+
+    if os.path.exists(icon_path):
+        icon = QIcon(icon_path)
+        app.setWindowIcon(icon)
+    else:
+        print("Icon not found:", icon_path)
+
     w = MainWindow()
+    if os.path.exists(icon_path):
+        w.setWindowIcon(QIcon(icon_path))
+
     w.show()
     sys.exit(app.exec_())
 

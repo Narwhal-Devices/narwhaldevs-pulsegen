@@ -7,4 +7,3 @@ sys.path.insert(0, str(current_file_path.parent.parent / 'src'))
 import ndpulsegen
 ndpulsegen.gui.main()
 
-
